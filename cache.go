@@ -21,8 +21,8 @@ type Cache struct {
 }
 
 // NewCache returns a new instance of the Cache struct.
-func NewCache(ctx context.Context, min int64) (*Cache, error) {
-	config := bigcache.DefaultConfig(time.Duration(min) * time.Minute)
+func NewCache(ctx context.Context, minute int64) (*Cache, error) {
+	config := bigcache.DefaultConfig(time.Duration(minute) * time.Minute)
 	cache, err := bigcache.New(ctx, config)
 	if err != nil {
 		return nil, err
