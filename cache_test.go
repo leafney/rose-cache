@@ -9,13 +9,13 @@
 package rcache
 
 import (
-	"context"
 	"testing"
 	"time"
 )
 
 func TestNewCache(t *testing.T) {
-	c, err := NewCache(context.Background(), 1)
+	c, err := NewCache(1)
+	//c, err := NewCache(10, WithContext(context.Background()))
 	if err != nil {
 		t.Error(err)
 		return
