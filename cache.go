@@ -11,6 +11,7 @@ package rcache
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"github.com/allegro/bigcache/v3"
 	"sync"
@@ -23,10 +24,36 @@ type Cache struct {
 	cancel context.CancelFunc
 }
 
+type Option func(ctx *context.Context, config *bigcache.Config)
+
+// WithContext allows setting a custom context for the BigCache instance.
+func WithContext(ctx context.Context) Option {
+	return func(c *context.Context, cfg *bigcache.Config) {
+		*c = ctx
+	}
+}
+
+func WithLifeWindow(life time.Duration) Option {
+	return func(c *context.Context, cfg *bigcache.Config) {
+		cfg.LifeWindow = life
+	}
+}
+
+func WithCleanWindow(clean time.Duration) Option {
+	return func(c *context.Context, cfg *bigcache.Config) {
+		cfg.CleanWindow = clean
+	}
+}
+
 // NewCache returns a new instance of the Cache struct.
-func NewCache(ctx context.Context, minute int64) (*Cache, error) {
-	ctx, cancel := context.WithCancel(ctx)
+func NewCache(minute int64, opts ...Option) (*Cache, error) {
+	ctx, cancel := context.WithCancel(context.Background())
 	config := bigcache.DefaultConfig(time.Duration(minute) * time.Minute)
+
+	for _, opt := range opts {
+		opt(&ctx, &config)
+	}
+
 	cache, err := bigcache.New(ctx, config)
 	if err != nil {
 		cancel()
@@ -35,6 +62,19 @@ func NewCache(ctx context.Context, minute int64) (*Cache, error) {
 
 	return &Cache{cache: cache, cancel: cancel}, nil
 }
+
+//// NewCache returns a new instance of the Cache struct.
+//func NewCache(ctx context.Context, minute int64) (*Cache, error) {
+//	ctx, cancel := context.WithCancel(ctx)
+//	config := bigcache.DefaultConfig(time.Duration(minute) * time.Minute)
+//	cache, err := bigcache.New(ctx, config)
+//	if err != nil {
+//		cancel()
+//		return nil, err
+//	}
+//
+//	return &Cache{cache: cache, cancel: cancel}, nil
+//}
 
 // Get retrieves a value from the cache using the provided key.
 func (c *Cache) Get(key string) ([]byte, error) {
@@ -124,7 +164,7 @@ func (c *Cache) Has(key string) bool {
 
 	_, err := c.cache.Get(key)
 	if err != nil {
-		if err == bigcache.ErrEntryNotFound {
+		if errors.Is(err, bigcache.ErrEntryNotFound) {
 			return false
 		}
 		return false
