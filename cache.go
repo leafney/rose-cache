@@ -190,6 +190,8 @@ func (c *Cache) SetValue(key string, value interface{}) error {
 	}
 }
 
+
+
 // SetEX 使用过期时间在缓存中设置一个值。
 // 值将在指定的持续时间后从缓存中删除。
 // 如果键为空或在设置操作中出现任何问题，则返回错误。
@@ -226,6 +228,42 @@ func (c *Cache) SetEX(key string, value []byte, expiration time.Duration) error 
 func (c *Cache) SetEXString(key, value string, expiration time.Duration) error {
 	return c.SetEX(key, []byte(value), expiration)
 }
+
+
+// SetEXValue 使用过期时间在缓存中设置一个值。
+// 值将在指定的持续时间后从缓存中删除。
+// 如果键为空或在设置操作中出现任何问题，则返回错误。
+func (c *Cache) SetEXValue(key string, value interface{}, expiration time.Duration) error {
+	if c.cache == nil {
+		return ErrNilCache
+	}
+	if key == "" {
+		return ErrKeyEmpty
+	}
+
+	// 将值序列化为字节切片
+	data, err := json.Marshal(value)
+	if err != nil {
+		return fmt.Errorf("failed to marshal value: %w", err)
+	}
+
+	// 创建带时间戳的包装结构
+	wrapper := struct {
+		Value     []byte    `json:"value"`
+		ExpiresAt time.Time `json:"expires_at"`
+	}{
+		Value:     data,
+		ExpiresAt: time.Now().Add(expiration),
+	}
+
+	wrappedData, err := json.Marshal(wrapper)
+	if err != nil {
+		return fmt.Errorf("failed to marshal wrapper: %w", err)
+	}
+
+	return c.cache.Set(key, wrappedData)
+}
+
 
 // Delete 根据提供的键从缓存中删除一个值。
 // 如果键为空或在删除过程中出现任何问题，则返回错误。
