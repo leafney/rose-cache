@@ -30,7 +30,7 @@ var (
 // Cache 结构体封装了对 bigcache 的操作
 type Cache struct {
 	cache  *bigcache.BigCache
-	mutex  sync.RWMutex    // 读写锁，适用于读多写少的场景
+	mutex  sync.RWMutex // 读写锁，适用于读多写少的场景
 	cancel context.CancelFunc
 }
 
@@ -72,7 +72,7 @@ func WithCleanWindow(clean time.Duration) Option {
 //	cache, err := NewCache(10)
 //
 //	// 创建一个自定义配置的缓存
-//	cache, err := NewCache(10, 
+//	cache, err := NewCache(10,
 //	    WithLifeWindow(5*time.Minute),
 //	    WithCleanWindow(1*time.Minute),
 //	)
@@ -90,7 +90,7 @@ func NewCache(minute int64, opts ...Option) (*Cache, error) {
 		return nil, err
 	}
 
-	return &Cache{cache: cache, cancel: cancel,mutex: sync.RWMutex{}}, nil
+	return &Cache{cache: cache, cancel: cancel, mutex: sync.RWMutex{}}, nil
 }
 
 // Close 关闭缓存并释放资源
@@ -144,9 +144,9 @@ func (c *Cache) Get(key string) ([]byte, error) {
 	if c.cache == nil {
 		return nil, ErrNilCache
 	}
-	
+
 	value, err := c.cache.Get(key)
-	if err == bigcache.ErrEntryNotFound {
+	if errors.Is(err, bigcache.ErrEntryNotFound) {
 		return nil, ErrKeyNotFound
 	}
 	return value, err
@@ -172,7 +172,7 @@ func (c *Cache) Set(key string, value []byte) error {
 	if c.cache == nil {
 		return ErrNilCache
 	}
-	
+
 	return c.cache.Set(key, value)
 }
 
@@ -189,7 +189,7 @@ func (c *Cache) SetS(key string, value string) error {
 // CacheType 定义缓存数据结构
 type CacheType struct {
 	Data   []byte
-	Expire int64    // 过期时间戳（0表示永不过期）
+	Expire int64 // 过期时间戳（0表示永不过期）
 }
 
 // XSet 使用 gob 序列化存储数据，数据永不过期
@@ -254,7 +254,7 @@ func (c *Cache) XGet(key string) ([]byte, error) {
 
 	// 获取原始数据
 	data, err := c.cache.Get(key)
-	if err == bigcache.ErrEntryNotFound {
+	if errors.Is(err, bigcache.ErrEntryNotFound) {
 		return nil, ErrKeyNotFound
 	}
 	if err != nil {
@@ -350,8 +350,8 @@ func (c *Cache) XSetExSec(key string, value []byte, seconds int64) error {
 	}
 
 	ct := &CacheType{
-		Data:    value,
-		Expire:  time.Now().Add(time.Duration(seconds)*time.Second).Unix(),
+		Data:   value,
+		Expire: time.Now().Add(time.Duration(seconds) * time.Second).Unix(),
 	}
 
 	var buf bytes.Buffer
@@ -403,7 +403,7 @@ func (c *Cache) XExpireAt(key string, tm time.Time) error {
 
 	// 获取原始数据
 	data, err := c.cache.Get(key)
-	if err == bigcache.ErrEntryNotFound {
+	if errors.Is(err, bigcache.ErrEntryNotFound) {
 		return ErrKeyNotFound
 	}
 	if err != nil {
@@ -472,7 +472,7 @@ func (c *Cache) XTTL(key string) (int64, error) {
 
 	// 获取原始数据
 	data, err := c.cache.Get(key)
-	if err == bigcache.ErrEntryNotFound {
+	if errors.Is(err, bigcache.ErrEntryNotFound) {
 		return -2, nil // 键不存在返回 -2
 	}
 	if err != nil {
@@ -535,10 +535,10 @@ func (c *Cache) XIncrBy(key string, increment int64) (int64, error) {
 	// 尝试获取现有值
 	var currentVal int64
 	data, err := c.XGet(key)
-	if err != nil && err != ErrKeyNotFound {
+	if err != nil && !errors.Is(err, ErrKeyNotFound) {
 		return 0, err
 	}
-	
+
 	if err == nil {
 		// 如果键存在，尝试转换为int64
 		currentVal, err = strconv.ParseInt(string(data), 10, 64)
@@ -549,7 +549,7 @@ func (c *Cache) XIncrBy(key string, increment int64) (int64, error) {
 
 	// 执行增加操作
 	newVal := currentVal + increment
-	
+
 	// 存储新值
 	err = c.XSet(key, []byte(strconv.FormatInt(newVal, 10)))
 	if err != nil {
@@ -577,4 +577,3 @@ func (c *Cache) XDecr(key string) (int64, error) {
 func (c *Cache) XDecrBy(key string, decrement int64) (int64, error) {
 	return c.XIncrBy(key, -decrement)
 }
-

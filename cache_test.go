@@ -9,6 +9,7 @@
 package rcache
 
 import (
+	"errors"
 	"testing"
 	"time"
 )
@@ -253,7 +254,7 @@ func TestExpirationOperations(t *testing.T) {
 
 		time.Sleep(3 * time.Second)
 		_, err = c.XGet("key1")
-		if err != ErrKeyNotFound {
+		if !errors.Is(err, ErrKeyNotFound) {
 			t.Errorf("Expected ErrKeyNotFound after expiration, got %v", err)
 		}
 	})
