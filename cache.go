@@ -9,10 +9,11 @@
 package rcache
 
 import (
+	"bytes"
 	"context"
-	"encoding/json"
+	"encoding/gob"
 	"errors"
-	"fmt"
+	"strconv"
 	"sync"
 	"time"
 
@@ -26,9 +27,10 @@ var (
 	ErrNilCache    = errors.New("cache is nil")
 )
 
+// Cache 结构体封装了对 bigcache 的操作
 type Cache struct {
 	cache  *bigcache.BigCache
-	mutex  sync.RWMutex
+	mutex  sync.RWMutex    // 读写锁，适用于读多写少的场景
 	cancel context.CancelFunc
 }
 
@@ -61,9 +63,19 @@ func WithCleanWindow(clean time.Duration) Option {
 }
 
 // NewCache 返回一个新的 Cache 实例。
-// 它使用提供的配置选项初始化一个新的 BigCache 实例。
-// 缓存将根据提供的分钟参数具有默认的生命周期。
-// 如果指定了任何选项，将应用于缓存配置。
+// minute 参数指定默认的缓存生命周期（分钟）
+// opts 可选参数用于自定义缓存配置
+//
+// Example:
+//
+//	// 创建一个默认10分钟过期的缓存
+//	cache, err := NewCache(10)
+//
+//	// 创建一个自定义配置的缓存
+//	cache, err := NewCache(10, 
+//	    WithLifeWindow(5*time.Minute),
+//	    WithCleanWindow(1*time.Minute),
+//	)
 func NewCache(minute int64, opts ...Option) (*Cache, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	config := bigcache.DefaultConfig(time.Duration(minute) * time.Minute)
@@ -78,230 +90,491 @@ func NewCache(minute int64, opts ...Option) (*Cache, error) {
 		return nil, err
 	}
 
-	return &Cache{cache: cache, cancel: cancel}, nil
+	return &Cache{cache: cache, cancel: cancel,mutex: sync.RWMutex{}}, nil
 }
 
-// Get 根据提供的键从缓存中检索值。
-// 返回值为字节切片，如果键不存在或检索过程中出现其他问题，则返回错误。
-// 此方法是线程安全的。
-func (c *Cache) Get(key string) ([]byte, error) {
-	if c.cache == nil {
-		return nil, ErrNilCache
-	}
-	if key == "" {
-		return nil, ErrKeyEmpty
-	}
-
-	value, err := c.cache.Get(key)
-	if err != nil {
-		if errors.Is(err, bigcache.ErrEntryNotFound) {
-			return nil, ErrKeyNotFound
-		}
-		return nil, err
-	}
-
-	// 尝试将值反序列化为包装结构（用于 SetEX 值）
-	wrapper := struct {
-		Value     []byte    `json:"value"`
-		ExpiresAt time.Time `json:"expires_at"`
-	}{}
-
-	if err := json.Unmarshal(value, &wrapper); err != nil {
-		// 如果反序列化失败，则返回常规值
-		return value, nil
-	}
-
-	// 检查值是否已过期
-	if time.Now().After(wrapper.ExpiresAt) {
-		c.cache.Delete(key)
-		return nil, ErrKeyNotFound
-	}
-
-	return wrapper.Value, nil
-}
-
-// GetString 根据提供的键从缓存中检索值并返回字符串。
-func (c *Cache) GetString(key string) (string, error) {
-	value, err := c.Get(key)
-	if err != nil {
-		return "", err
-	}
-
-	return string(value), nil
-}
-
-// GetValue 根据提供的键从缓存中检索值。
-func (c *Cache) GetValue(key string, value interface{}) error {
-	data, err := c.cache.Get(key)
-	if err != nil {
-		return err
-	}
-
-	switch value := value.(type) {
-	case *string:
-		*value = string(data)
-	default:
-		if err := json.Unmarshal(data, value); err != nil {
-			return fmt.Errorf("failed to unmarshal data: %v", err)
-		}
-	}
-
-	return nil
-}
-
-// Set 使用提供的键和值在缓存中设置一个值。
-// 如果键为空或在设置操作中出现任何问题，则返回错误。
-// 此方法是线程安全的。
-func (c *Cache) Set(key string, value []byte) error {
-	if c.cache == nil {
-		return ErrNilCache
-	}
-	if key == "" {
-		return ErrKeyEmpty
-	}
-	if len(value) == 0 {
-		return ErrValueEmpty
-	}
-
-	return c.cache.Set(key, value)
-}
-
-// SetString 使用提供的键和值在缓存中设置一个字符串值。
-func (c *Cache) SetString(key, value string) error {
-	return c.cache.Set(key, []byte(value))
-}
-
-// SetValue 使用提供的键和值在缓存中设置一个值。
-func (c *Cache) SetValue(key string, value interface{}) error {
+// Close 关闭缓存并释放资源
+// 在程序结束时调用此方法以确保资源被正确释放
+//
+// Example:
+//
+//	cache, err := NewCache(10)
+//	if err != nil {
+//	    // 处理错误
+//	}
+//	defer cache.Close()
+func (c *Cache) Close() error {
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
 
-	switch v := value.(type) {
-	case string:
-		return c.cache.Set(key, []byte(v))
-	case []byte:
-		return c.cache.Set(key, v)
-	default:
-		data, err := json.Marshal(value)
-		if err != nil {
-			return fmt.Errorf("failed to marshal data: %v", err)
-		}
-		return c.cache.Set(key, data)
-	}
-}
-
-
-
-// SetEX 使用过期时间在缓存中设置一个值。
-// 值将在指定的持续时间后从缓存中删除。
-// 如果键为空或在设置操作中出现任何问题，则返回错误。
-func (c *Cache) SetEX(key string, value []byte, expiration time.Duration) error {
-	if c.cache == nil {
-		return ErrNilCache
-	}
-	if key == "" {
-		return ErrKeyEmpty
-	}
-	if len(value) == 0 {
-		return ErrValueEmpty
-	}
-
-	// 创建带时间戳的包装结构
-	wrapper := struct {
-		Value     []byte    `json:"value"`
-		ExpiresAt time.Time `json:"expires_at"`
-	}{
-		Value:     value,
-		ExpiresAt: time.Now().Add(expiration),
-	}
-
-	data, err := json.Marshal(wrapper)
-	if err != nil {
-		return fmt.Errorf("failed to marshal value: %w", err)
-	}
-
-	return c.cache.Set(key, data)
-}
-
-// SetEXString 使用过期时间在缓存中设置一个字符串值。
-// 这是一个便捷方法，先将字符串转换为字节切片，然后调用 SetEX。
-func (c *Cache) SetEXString(key, value string, expiration time.Duration) error {
-	return c.SetEX(key, []byte(value), expiration)
-}
-
-
-// SetEXValue 使用过期时间在缓存中设置一个值。
-// 值将在指定的持续时间后从缓存中删除。
-// 如果键为空或在设置操作中出现任何问题，则返回错误。
-func (c *Cache) SetEXValue(key string, value interface{}, expiration time.Duration) error {
-	if c.cache == nil {
-		return ErrNilCache
-	}
-	if key == "" {
-		return ErrKeyEmpty
-	}
-
-	// 将值序列化为字节切片
-	data, err := json.Marshal(value)
-	if err != nil {
-		return fmt.Errorf("failed to marshal value: %w", err)
-	}
-
-	// 创建带时间戳的包装结构
-	wrapper := struct {
-		Value     []byte    `json:"value"`
-		ExpiresAt time.Time `json:"expires_at"`
-	}{
-		Value:     data,
-		ExpiresAt: time.Now().Add(expiration),
-	}
-
-	wrappedData, err := json.Marshal(wrapper)
-	if err != nil {
-		return fmt.Errorf("failed to marshal wrapper: %w", err)
-	}
-
-	return c.cache.Set(key, wrappedData)
-}
-
-
-// Delete 根据提供的键从缓存中删除一个值。
-// 如果键为空或在删除过程中出现任何问题，则返回错误。
-func (c *Cache) Delete(key string) error {
-	if c.cache == nil {
-		return ErrNilCache
-	}
-	if key == "" {
-		return ErrKeyEmpty
-	}
-
-	return c.cache.Delete(key)
-}
-
-// Has 检查缓存中是否存在某个键。
-// 如果键存在，则返回 true，否则返回 false。
-// 此方法是线程安全的。
-func (c *Cache) Has(key string) bool {
-	c.mutex.RLock()
-	defer c.mutex.RUnlock()
-
-	_, err := c.cache.Get(key)
-	if err != nil {
-		if errors.Is(err, bigcache.ErrEntryNotFound) {
-			return false
-		}
-		return false
-	}
-	return true
-}
-
-// Close 关闭缓存并释放与之相关的任何资源。
-// 当缓存不再需要时，应调用此方法以确保正确清理。
-func (c *Cache) Close() {
 	if c.cancel != nil {
 		c.cancel()
 	}
 	if c.cache != nil {
-		c.cache.Close()
+		return c.cache.Close()
 	}
+	return ErrNilCache
 }
+
+// Del 删除指定键的缓存项
+func (c *Cache) Del(key string) error {
+	if key == "" {
+		return ErrKeyEmpty
+	}
+	if c.cache == nil {
+		return ErrNilCache
+	}
+	return c.cache.Delete(key)
+}
+
+// Exists 检查键是否存在于缓存中
+func (c *Cache) Exists(key string) bool {
+	if key == "" || c.cache == nil {
+		return false
+	}
+	_, err := c.cache.Get(key)
+	return err == nil
+}
+
+// Get 获取指定键的缓存值
+func (c *Cache) Get(key string) ([]byte, error) {
+	if key == "" {
+		return nil, ErrKeyEmpty
+	}
+	if c.cache == nil {
+		return nil, ErrNilCache
+	}
+	
+	value, err := c.cache.Get(key)
+	if err == bigcache.ErrEntryNotFound {
+		return nil, ErrKeyNotFound
+	}
+	return value, err
+}
+
+// GetS 获取指定键的字符串类型缓存值
+func (c *Cache) GetS(key string) (string, error) {
+	value, err := c.Get(key)
+	if err != nil {
+		return "", err
+	}
+	return string(value), nil
+}
+
+// Set 设置缓存键值对
+func (c *Cache) Set(key string, value []byte) error {
+	if key == "" {
+		return ErrKeyEmpty
+	}
+	if value == nil {
+		return ErrValueEmpty
+	}
+	if c.cache == nil {
+		return ErrNilCache
+	}
+	
+	return c.cache.Set(key, value)
+}
+
+// SetS 设置字符串类型的缓存键值对
+func (c *Cache) SetS(key string, value string) error {
+	if value == "" {
+		return ErrValueEmpty
+	}
+	return c.Set(key, []byte(value))
+}
+
+// *******************
+
+// CacheType 定义缓存数据结构
+type CacheType struct {
+	Data   []byte
+	Expire int64    // 过期时间戳（0表示永不过期）
+}
+
+// XSet 使用 gob 序列化存储数据，数据永不过期
+//
+// Example:
+//
+//	err := cache.XSet("key", []byte("value"))
+func (c *Cache) XSet(key string, value []byte) error {
+	if key == "" {
+		return ErrKeyEmpty
+	}
+	if value == nil {
+		return ErrValueEmpty
+	}
+	if c.cache == nil {
+		return ErrNilCache
+	}
+
+	// 创建 CacheType 实例
+	ct := &CacheType{
+		Data:   value,
+		Expire: 0, // 默认不过期
+	}
+
+	var buf bytes.Buffer
+	enc := gob.NewEncoder(&buf)
+	if err := enc.Encode(ct); err != nil {
+		return err
+	}
+
+	return c.cache.Set(key, buf.Bytes())
+}
+
+// XSetS 使用 gob 序列化存储字符串数据，数据永不过期
+//
+// Example:
+//
+//	err := cache.XSetS("key", "value")
+func (c *Cache) XSetS(key string, value string) error {
+	if value == "" {
+		return ErrValueEmpty
+	}
+	return c.XSet(key, []byte(value))
+}
+
+// XGet 获取 gob 序列化存储的数据
+// 如果数据已过期，会自动删除并返回 ErrKeyNotFound
+//
+// Example:
+//
+//	data, err := cache.XGet("key")
+//	if err == ErrKeyNotFound {
+//	    // 处理键不存在的情况
+//	}
+func (c *Cache) XGet(key string) ([]byte, error) {
+	if key == "" {
+		return nil, ErrKeyEmpty
+	}
+	if c.cache == nil {
+		return nil, ErrNilCache
+	}
+
+	// 获取原始数据
+	data, err := c.cache.Get(key)
+	if err == bigcache.ErrEntryNotFound {
+		return nil, ErrKeyNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	// 解码 gob 数据
+	var ct CacheType
+	dec := gob.NewDecoder(bytes.NewReader(data))
+	if err := dec.Decode(&ct); err != nil {
+		return nil, err
+	}
+
+	// 检查是否过期
+	if ct.Expire > 0 && ct.Expire <= time.Now().Unix() {
+		c.Del(key) // 删除过期数据
+		return nil, ErrKeyNotFound
+	}
+
+	return ct.Data, nil
+}
+
+// XGetS 获取 gob 序列化存储的字符串数据
+//
+// Example:
+//
+//	str, err := cache.XGetS("key")
+//	if err != nil {
+//	    // 处理错误
+//	}
+func (c *Cache) XGetS(key string) (string, error) {
+	data, err := c.XGet(key)
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
+}
+
+// XSetEx 使用 Duration 类型设置过期时间存储数据
+//
+// Example:
+//
+//	// 存储10分钟后过期的数据
+//	err := cache.XSetEx("key", []byte("value"), 10*time.Minute)
+func (c *Cache) XSetEx(key string, value []byte, expires time.Duration) error {
+	if key == "" {
+		return ErrKeyEmpty
+	}
+	if value == nil {
+		return ErrValueEmpty
+	}
+	if c.cache == nil {
+		return ErrNilCache
+	}
+
+	ct := &CacheType{
+		Data:   value,
+		Expire: time.Now().Add(expires).Unix(),
+	}
+
+	var buf bytes.Buffer
+	enc := gob.NewEncoder(&buf)
+	if err := enc.Encode(ct); err != nil {
+		return err
+	}
+
+	return c.cache.Set(key, buf.Bytes())
+}
+
+// XSetExS 使用 Duration 类型设置过期时间存储字符串数据
+//
+// Example:
+//
+//	// 存储1小时后过期的字符串
+//	err := cache.XSetExS("key", "value", time.Hour)
+func (c *Cache) XSetExS(key string, value string, expires time.Duration) error {
+	if value == "" {
+		return ErrValueEmpty
+	}
+	return c.XSetEx(key, []byte(value), expires)
+}
+
+// XSetExSec 使用秒数设置过期时间存储数据
+func (c *Cache) XSetExSec(key string, value []byte, seconds int64) error {
+	if key == "" {
+		return ErrKeyEmpty
+	}
+	if value == nil {
+		return ErrValueEmpty
+	}
+	if c.cache == nil {
+		return ErrNilCache
+	}
+
+	ct := &CacheType{
+		Data:    value,
+		Expire:  time.Now().Add(time.Duration(seconds)*time.Second).Unix(),
+	}
+
+	var buf bytes.Buffer
+	enc := gob.NewEncoder(&buf)
+	if err := enc.Encode(ct); err != nil {
+		return err
+	}
+
+	return c.cache.Set(key, buf.Bytes())
+}
+
+// XSetExSecS 使用秒数设置过期时间存储字符串数据
+func (c *Cache) XSetExSecS(key string, value string, seconds int64) error {
+	if value == "" {
+		return ErrValueEmpty
+	}
+	return c.XSetExSec(key, []byte(value), seconds)
+}
+
+// XExpireAt 设置键在指定时间点过期
+//
+// Example:
+//
+//	// 设置在1小时后过期
+//	err := cache.XExpireAt("key", time.Now().Add(time.Hour))
+//
+//	// 设置在明天零点过期
+//	tomorrow := time.Now().Add(24*time.Hour)
+//	expireTime := time.Date(
+//	    tomorrow.Year(), tomorrow.Month(), tomorrow.Day(),
+//	    0, 0, 0, 0, tomorrow.Location(),
+//	)
+//	err := cache.XExpireAt("key", expireTime)
+func (c *Cache) XExpireAt(key string, tm time.Time) error {
+	if key == "" {
+		return ErrKeyEmpty
+	}
+	if c.cache == nil {
+		return ErrNilCache
+	}
+
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	expireAt := tm.Unix()
+	if expireAt <= time.Now().Unix() {
+		return c.Del(key)
+	}
+
+	// 获取原始数据
+	data, err := c.cache.Get(key)
+	if err == bigcache.ErrEntryNotFound {
+		return ErrKeyNotFound
+	}
+	if err != nil {
+		return err
+	}
+
+	// 解码现有数据
+	var ct CacheType
+	dec := gob.NewDecoder(bytes.NewReader(data))
+	if err := dec.Decode(&ct); err != nil {
+		return err
+	}
+
+	// 更新过期时间
+	ct.Expire = expireAt
+
+	// 重新编码并存储
+	var buf bytes.Buffer
+	enc := gob.NewEncoder(&buf)
+	if err := enc.Encode(&ct); err != nil {
+		return err
+	}
+
+	return c.cache.Set(key, buf.Bytes())
+}
+
+// XExpire 设置键的过期时间（Duration类型）
+//
+// Example:
+//
+//	// 设置5分钟后过期
+//	err := cache.XExpire("key", 5*time.Minute)
+func (c *Cache) XExpire(key string, expires time.Duration) error {
+	return c.XExpireAt(key, time.Now().Add(expires))
+}
+
+// XExpireSec 设置键的过期时间（秒数）
+func (c *Cache) XExpireSec(key string, seconds int64) error {
+	return c.XExpireAt(key, time.Now().Add(time.Duration(seconds)*time.Second))
+}
+
+// XTTL 获取键的剩余生存时间（秒）
+// 返回值说明：
+//   - -2: 键不存在
+//   - -1: 键存在但没有设置过期时间
+//   - >= 0: 剩余生存时间（秒）
+//
+// Example:
+//
+//	ttl, err := cache.XTTL("key")
+//	switch ttl {
+//	case -2:
+//	    fmt.Println("键不存在")
+//	case -1:
+//	    fmt.Println("键永不过期")
+//	default:
+//	    fmt.Printf("剩余 %d 秒\n", ttl)
+//	}
+func (c *Cache) XTTL(key string) (int64, error) {
+	if key == "" {
+		return -2, ErrKeyEmpty
+	}
+	if c.cache == nil {
+		return -2, ErrNilCache
+	}
+
+	// 获取原始数据
+	data, err := c.cache.Get(key)
+	if err == bigcache.ErrEntryNotFound {
+		return -2, nil // 键不存在返回 -2
+	}
+	if err != nil {
+		return -2, err
+	}
+
+	// 解码数据
+	var ct CacheType
+	dec := gob.NewDecoder(bytes.NewReader(data))
+	if err := dec.Decode(&ct); err != nil {
+		return -2, err
+	}
+
+	// 如果没有设置过期时间
+	if ct.Expire == 0 {
+		return -1, nil // 永不过期返回 -1
+	}
+
+	// 计算剩余时间
+	remaining := ct.Expire - time.Now().Unix()
+	if remaining <= 0 {
+		c.Del(key) // 已过期，删除键
+		return -2, nil
+	}
+
+	return remaining, nil
+}
+
+// XIncr 将键存储的数字值加1
+// 如果键不存在，会创建并设置值为1
+//
+// Example:
+//
+//	newVal, err := cache.XIncr("counter")
+//	// newVal 是增加后的新值
+func (c *Cache) XIncr(key string) (int64, error) {
+	return c.XIncrBy(key, 1)
+}
+
+// XIncrBy 将键存储的数字值增加指定的增量
+//
+// Example:
+//
+//	// 增加5
+//	newVal, err := cache.XIncrBy("counter", 5)
+//
+//	// 减少3（通过负数实现）
+//	newVal, err := cache.XIncrBy("counter", -3)
+func (c *Cache) XIncrBy(key string, increment int64) (int64, error) {
+	if key == "" {
+		return 0, ErrKeyEmpty
+	}
+	if c.cache == nil {
+		return 0, ErrNilCache
+	}
+
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	// 尝试获取现有值
+	var currentVal int64
+	data, err := c.XGet(key)
+	if err != nil && err != ErrKeyNotFound {
+		return 0, err
+	}
+	
+	if err == nil {
+		// 如果键存在，尝试转换为int64
+		currentVal, err = strconv.ParseInt(string(data), 10, 64)
+		if err != nil {
+			return 0, errors.New("value is not an integer")
+		}
+	}
+
+	// 执行增加操作
+	newVal := currentVal + increment
+	
+	// 存储新值
+	err = c.XSet(key, []byte(strconv.FormatInt(newVal, 10)))
+	if err != nil {
+		return 0, err
+	}
+
+	return newVal, nil
+}
+
+// XDecr 将键存储的数字值减1
+//
+// Example:
+//
+//	newVal, err := cache.XDecr("counter")
+func (c *Cache) XDecr(key string) (int64, error) {
+	return c.XDecrBy(key, 1)
+}
+
+// XDecrBy 将键存储的数字值减少指定的减量
+//
+// Example:
+//
+//	// 减少5
+//	newVal, err := cache.XDecrBy("counter", 5)
+func (c *Cache) XDecrBy(key string, decrement int64) (int64, error) {
+	return c.XIncrBy(key, -decrement)
+}
+
